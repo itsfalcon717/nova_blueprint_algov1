@@ -128,7 +128,6 @@ def iterative_sampling_loop(
             bt.logging.warning("[Miner] Scoring failed or mismatched; continuing")
             continue
 
-        # Calculate final scores per molecule
         batch_scores = calculate_final_scores(score_dict, sampler_data, config, save_all_scores)
 
         try:
