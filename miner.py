@@ -3,9 +3,12 @@ os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 import sys
 import json
+import traceback
+import time
 
 import bittensor as bt
 import pandas as pd
+from rdkit import Chem
 from pathlib import Path
 import nova_ph2
 
@@ -16,7 +19,9 @@ sys.path.append(PARENT_DIR)
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
 
 from nova_ph2.neurons.validator.scoring import score_molecules_json
+import nova_ph2.neurons.validator.scoring as scoring_module
 from random_sampler import run_sampler
+from nova_ph2.combinatorial_db.reactions import get_smiles_from_reaction
 
 DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
 
@@ -74,23 +79,19 @@ def iterative_sampling_loop(
 
         try:
             names = sampler_data["molecules"]
-            smiles = sampler_data["smiles"]
-            keys = sampler_data["inchikeys"]
             filtered_names = []
-            filtered_smiles = []
-            filtered_keys = []
-            for i, name in enumerate(names):
+            for name in names:
                 try:
-                    s = smiles[i] if i < len(smiles) else None
+                    s = get_smiles_from_reaction(name)
                     if not s:
                         continue
-                    
-                    key = keys[i] if i < len(keys) else None
+                    mol = Chem.MolFromSmiles(s)
+                    if not mol:
+                        continue
+                    key = Chem.MolToInchiKey(mol)
                     if key in seen_inchikeys:
                         continue
                     filtered_names.append(name)
-                    filtered_smiles.append(s)
-                    filtered_keys.append(key)
                 except Exception:
                     continue
 
@@ -102,18 +103,14 @@ def iterative_sampling_loop(
                 bt.logging.warning(f"{len(names) - len(filtered_names)} molecules were previously seen; continuing with unseen only")
 
             dup_ratio = (len(names) - len(filtered_names)) / max(1, len(names))
-            if dup_ratio > 0.6:
+            if dup_ratio > 0.62:
                 mutation_prob = min(0.5, mutation_prob * 1.5)
                 elite_frac = max(0.2, elite_frac * 0.8)
-            elif dup_ratio < 0.2 and not top_pool.empty:
+            elif dup_ratio < 0.22 and not top_pool.empty:
                 mutation_prob = max(0.05, mutation_prob * 0.9)
                 elite_frac = min(0.8, elite_frac * 1.1)
 
-            sampler_data = {
-                "molecules": filtered_names,
-                "smiles": filtered_smiles,
-                "inchikeys": filtered_keys,
-            }
+            sampler_data = {"molecules": filtered_names}
             with open(sampler_file_path, "w") as f:
                 json.dump(sampler_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -128,6 +125,7 @@ def iterative_sampling_loop(
             bt.logging.warning("[Miner] Scoring failed or mismatched; continuing")
             continue
 
+        # Calculate final scores per molecule
         batch_scores = calculate_final_scores(score_dict, sampler_data, config, save_all_scores)
 
         try:
@@ -161,8 +159,17 @@ def calculate_final_scores(score_dict: dict,
     """
 
     names = sampler_data["molecules"]
-    smiles = sampler_data["smiles"]
-    inchikey_list = sampler_data["inchikeys"]
+    smiles = [get_smiles_from_reaction(name) for name in names]
+
+    # Calculate InChIKey for each molecule to deduplicate molecules after merging
+    inchikey_list = []
+    
+    for s in smiles:
+        try:
+            inchikey_list.append(Chem.MolToInchiKey(Chem.MolFromSmiles(s)))
+        except Exception as e:
+            bt.logging.error(f"Error calculating InChIKey for {s}: {e}")
+            inchikey_list.append(None)
 
     # Calculate final scores for each molecule
     targets = score_dict[0]['target_scores']
@@ -209,7 +216,6 @@ def main(config: dict):
         config=config,
         save_all_scores=True,
     )
- 
  
 
 if __name__ == "__main__":

@@ -1,8 +1,5 @@
 import sys
-
 import os
-
-from reaction_utils import get_smiles_from_reaction
 
 PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(PARENT_DIR)
@@ -11,11 +8,13 @@ from rdkit import Chem
 from rdkit.Chem import Descriptors
 
 from nova_ph2.utils import (
-    get_heavy_atom_count
+    get_smiles, 
+    get_heavy_atom_count, 
+    compute_maccs_entropy
 )
 
 def validate_molecules_sampler(
-    sampler_data: dict[str, list],
+    sampler_data: dict[int, dict[str, list]],
     config: dict,
 ) -> dict[int, dict[str, list[str]]]:
     """
@@ -35,15 +34,13 @@ def validate_molecules_sampler(
 
     valid_smiles = []
     valid_names = []
-    valid_keys = []
                 
     for molecule in molecules:
         try:
             if molecule is None:
                 continue
             
-            # smiles = get_smiles(molecule)
-            smiles = get_smiles_from_reaction(molecule)
+            smiles = get_smiles(molecule)
             if not smiles:
                 continue
             
@@ -55,34 +52,12 @@ def validate_molecules_sampler(
                 num_rotatable_bonds = Descriptors.NumRotatableBonds(mol)
                 if num_rotatable_bonds < config['min_rotatable_bonds'] or num_rotatable_bonds > config['max_rotatable_bonds']:
                     continue
-                
-                key = Chem.MolToInchiKey(mol)
             except Exception as e:
                 continue
     
             valid_smiles.append(smiles)
             valid_names.append(molecule)
-            valid_keys.append(key)
         except Exception as e:
             continue
         
-    return valid_names, valid_smiles, valid_keys
-
-
-
-
-def find_chemically_identical(key_list: list[str]) -> dict:
-    """
-    Check for identical molecules in a list of SMILES strings by converting to InChIKeys.
-    """
-    inchikey_to_indices = {}
-    
-    for i, inchikey in enumerate(key_list):
-        if inchikey not in inchikey_to_indices:
-            inchikey_to_indices[inchikey] = [i]
-        else:
-            inchikey_to_indices[inchikey].append(i)
-    
-    duplicates = {k: v for k, v in inchikey_to_indices.items() if len(v) > 1}
-    
-    return duplicates
+    return valid_names, valid_smiles
