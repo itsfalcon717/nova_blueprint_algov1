@@ -1,433 +1,360 @@
-import os
-os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-import sys
-import json
-import time
+from rdkit import Chem
 import bittensor as bt
+from rdkit.Chem import Descriptors
+from dotenv import load_dotenv
 import pandas as pd
-import numpy as np
-from pathlib import Path
-from collections import defaultdict
-from typing import Dict, List
-import nova_ph2
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__)))
-PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-sys.path.append(PARENT_DIR)
-
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
-
-from nova_ph2.PSICHIC.wrapper import PsichicWrapper
-from nova_ph2.PSICHIC.psichic_utils.data_utils import virtual_screening
-
-from molecules import generate_valid_random_molecules_batch
-
-DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
+import warnings
+import sqlite3
+import random
+import os
+from functools import lru_cache
+from typing import List, Tuple
+load_dotenv(override=True)
+warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
+from nova_ph2.combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
+from nova_ph2.utils.molecules import get_heavy_atom_count
 
 
-target_models = []
-antitarget_models = []
-
-def get_config(input_file: str = os.path.join(BASE_DIR, "input.json")):
-    with open(input_file, "r") as f:
-        d = json.load(f)
-    return {**d.get("config", {}), **d.get("challenge", {})}
-
-
-def initialize_models(config: dict):
-    """Initialize separate model instances for each target and antitarget sequence."""
-    global target_models, antitarget_models
-    target_models = []
-    antitarget_models = []
-    
-    for seq in config["target_sequences"]:
-        wrapper = PsichicWrapper()
-        wrapper.initialize_model(seq)
-        target_models.append(wrapper)
-    
-    for seq in config["antitarget_sequences"]:
-        wrapper = PsichicWrapper()
-        wrapper.initialize_model(seq)
-        antitarget_models.append(wrapper)
-
-
-# ---------- PARALLEL SCORING FUNCTIONS ----------
-def score_single_target_model(model_idx: int, smiles_list: List[str]) -> tuple:
-    """Score molecules with a single target model."""
+@lru_cache(maxsize=200_000)
+def _get_smiles_from_reaction_cached(name: str):
+    """Cache SMILES retrieval to avoid repeated database queries."""
     try:
-        model = target_models[model_idx]
-        result = model.score_molecules(smiles_list)
-        scores = result['predicted_binding_affinity'].tolist()
-        smiles_dict = getattr(model, 'smiles_dict', {})
-        return (model_idx, scores, smiles_dict)
+        return get_smiles_from_reaction(name)
+    except Exception:
+        return None
+
+@lru_cache(maxsize=200_000)
+def _mol_from_smiles_cached(smiles: str):
+    """Cache molecule parsing to avoid repeated SMILES parsing."""
+    if not smiles:
+        return None
+    try:
+        return Chem.MolFromSmiles(smiles)
+    except Exception:
+        return None
+
+@lru_cache(maxsize=200_000)
+def _inchikey_from_name_cached(name: str) -> str:
+    """Cache InChIKey generation from molecule name to avoid repeated computation."""
+    try:
+        s = _get_smiles_from_reaction_cached(name)
+        if not s:
+            return ""
+        return generate_inchikey(s)
+    except Exception:
+        return ""
+
+def num_rotatable_bonds(smiles: str) -> int:
+    """Get number of rotatable bonds from SMILES string."""
+    if not smiles:
+        return 0
+    try:
+        mol = _mol_from_smiles_cached(smiles)
+        if mol is None:
+            return 0
+        return Descriptors.NumRotatableBonds(mol)
+    except Exception:
+        return 0
+
+def generate_inchikey(smiles: str) -> str:
+    """Generate InChIKey from SMILES string."""
+    if not smiles:
+        return ""
+    try:
+        mol = _mol_from_smiles_cached(smiles)
+        if mol is None:
+            return ""
+        return Chem.MolToInchiKey(mol)
     except Exception as e:
-        bt.logging.error(f"Target model {model_idx} scoring error: {e}")
-        return (model_idx, [0.0] * len(smiles_list), {})
+        bt.logging.error(f"Error generating InChIKey for SMILES {smiles}: {e}")
+        return ""
 
 
-def score_single_antitarget_model(model_idx: int, smiles_list: List[str], smiles_dict: dict) -> tuple:
-    """Score molecules with a single antitarget model."""
+def validate_molecules(data: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """
+    Validate molecules by checking heavy atom count and rotatable bonds.
+    Returns DataFrame with validated molecules and their descriptors.
+    Defer InChIKey generation until after validation to avoid waste.
+    """
+    if data.empty:
+        return data
+    
+    # Use vectorized operations where possible - apply is cached so it's reasonably fast
+    data = data.copy()
+    data['smiles'] = data["name"].apply(_get_smiles_from_reaction_cached)
+    
+    # Filter out None SMILES early
+    data = data[data['smiles'].notna()]
+    if data.empty:
+        return data
+    
+    # Get descriptors for all molecules at once - apply is necessary here since functions aren't vectorizable
+    data['heavy_atoms'] = data["smiles"].apply(get_heavy_atom_count)
+    data['bonds'] = data["smiles"].apply(num_rotatable_bonds)
+    
+    # Filter by constraints BEFORE generating InChIKeys (saves expensive computation)
+    mask = (
+        (data['heavy_atoms'] >= config['min_heavy_atoms']) &
+        (data['bonds'] >= config['min_rotatable_bonds']) &
+        (data['bonds'] <= config['max_rotatable_bonds'])
+    )
+    data = data[mask]
+    
+    # Only generate InChIKeys for molecules that passed validation
+    if not data.empty:
+        data['InChIKey'] = data["smiles"].apply(generate_inchikey)
+    
+    return data
+
+
+@lru_cache(maxsize=None)
+def get_molecules_by_role(role_mask: int, db_path: str) -> List[Tuple[int, str, int]]:
     try:
-        model = antitarget_models[model_idx]
-        
-        # Set smiles data from target models
-        model.smiles_list = smiles_list
-        model.smiles_dict = smiles_dict
-        
-        # Create loader and run virtual screening
-        model.create_screen_loader(model.protein_dict, model.smiles_dict)
-        model.screen_df = virtual_screening(
-            model.screen_df, 
-            model.model, 
-            model.screen_loader,
-            os.getcwd(),
-            save_interpret=False,
-            ligand_dict=model.smiles_dict, 
-            device=model.device,
-            save_cluster=False,
-        )
-        
-        scores = model.screen_df['predicted_binding_affinity'].tolist()
-        return (model_idx, scores)
+        abs_db_path = os.path.abspath(db_path)
+        with sqlite3.connect(f"file:{abs_db_path}?mode=ro&immutable=1", uri=True) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT mol_id, smiles, role_mask FROM molecules WHERE (role_mask & ?) = ?", 
+                (role_mask, role_mask)
+            )
+            results = cursor.fetchall()
+        return results
     except Exception as e:
-        bt.logging.error(f"Antitarget model {model_idx} scoring error: {e}")
-        return (model_idx, [0.0] * len(smiles_list))
+        bt.logging.error(f"Error getting molecules by role {role_mask}: {e}")
+        return []
 
+def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: str, subnet_config: dict, 
+                                 batch_size: int = 200, seed: int = None,
+                                 elite_names: list[str] = None, elite_frac: float = 0.5, mutation_prob: float = 0.1,
+                                 avoid_inchikeys: set[str] = None, component_weights: dict = None) -> pd.DataFrame:
+    
+    reaction_info = get_reaction_info(rxn_id, db_path)
+    if not reaction_info:
+        bt.logging.error(f"Could not get reaction info for rxn_id {rxn_id}")
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+    
+    smarts, roleA, roleB, roleC = reaction_info
+    is_three_component = roleC is not None and roleC != 0
+    
+    molecules_A = get_molecules_by_role(roleA, db_path)
+    molecules_B = get_molecules_by_role(roleB, db_path)
+    molecules_C = get_molecules_by_role(roleC, db_path) if is_three_component else []
+    pool_A_ids = _ids_from_pool(molecules_A)
+    pool_B_ids = _ids_from_pool(molecules_B)
+    pool_C_ids = _ids_from_pool(molecules_C) if is_three_component else []
 
-def parallel_score_molecules(smiles_series: pd.Series, config: dict) -> tuple:
-    """
-    Score molecules against all target and antitarget models in parallel.
-    Returns (target_scores, antitarget_scores) as pandas Series.
-    """
-    global target_models, antitarget_models
+    if not molecules_A or not molecules_B or (is_three_component and not molecules_C):
+        bt.logging.error(f"No molecules found for roles A={roleA}, B={roleB}, C={roleC}")
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+
+    valid_dfs = []
+    seen_keys = set()
+    total_valid = 0
     
-    smiles_list = smiles_series.tolist()
-    n_molecules = len(smiles_list)
-    
-    if n_molecules == 0:
-        return pd.Series(dtype=float), pd.Series(dtype=float)
-    
-    target_scores_by_model = {}
-    antitarget_scores_by_model = {}
-    shared_smiles_dict = {}
-    
-    try:
-        # Step 1: Score all TARGET models in parallel
-        with ThreadPoolExecutor(max_workers=len(target_models)) as executor:
-            target_futures = {
-                executor.submit(score_single_target_model, idx, smiles_list): idx 
-                for idx in range(len(target_models))
-            }
-            
-            for future in as_completed(target_futures):
-                model_idx = target_futures[future]
-                try:
-                    idx, scores, smiles_dict = future.result()
-                    target_scores_by_model[idx] = scores
-                    shared_smiles_dict.update(smiles_dict)
-                except Exception as e:
-                    bt.logging.error(f"Target model {model_idx} future failed: {e}")
-                    target_scores_by_model[model_idx] = [0.0] * n_molecules
+    while total_valid < n_samples:
+        needed = n_samples - total_valid
+        batch_size_actual = min(max(batch_size, 300), needed * 2)
         
-        # Step 2: Score all ANTITARGET models in parallel
-        with ThreadPoolExecutor(max_workers=len(antitarget_models)) as executor:
-            antitarget_futures = {
-                executor.submit(score_single_antitarget_model, idx, smiles_list, shared_smiles_dict): idx 
-                for idx in range(len(antitarget_models))
-            }
-            
-            for future in as_completed(antitarget_futures):
-                model_idx = antitarget_futures[future]
-                try:
-                    idx, scores = future.result()
-                    antitarget_scores_by_model[idx] = scores
-                except Exception as e:
-                    bt.logging.error(f"Antitarget model {model_idx} future failed: {e}")
-                    antitarget_scores_by_model[model_idx] = [0.0] * n_molecules
-        
-        # Step 3: Average scores across models
-        if target_scores_by_model:
-            target_array = np.array([target_scores_by_model[i] for i in sorted(target_scores_by_model.keys())], 
-                                   dtype=np.float32)
-            avg_target_scores = target_array.mean(axis=0)
-            target_series = pd.Series(avg_target_scores)
+        emitted_names = set()
+        if elite_names:
+            n_elite = max(0, min(batch_size_actual, int(batch_size_actual * elite_frac)))
+            n_rand = batch_size_actual - n_elite
+
+            elite_batch = generate_offspring_from_elites(
+                rxn_id=rxn_id,
+                n=n_elite,
+                elite_names=elite_names,
+                pool_A_ids=pool_A_ids,
+                pool_B_ids=pool_B_ids,
+                pool_C_ids=pool_C_ids,
+                is_three_component=is_three_component,
+                mutation_prob=mutation_prob,
+                seed=seed,
+                avoid_names=emitted_names,
+                avoid_inchikeys=avoid_inchikeys,
+                max_tries=10,
+            )
+            emitted_names.update(elite_batch)
+
+            rand_batch = generate_molecules_from_pools(
+                rxn_id, n_rand, pool_A_ids, pool_B_ids, pool_C_ids, is_three_component, seed, component_weights
+            )
+            rand_batch = [n for n in rand_batch if n and (n not in emitted_names)]
+            batch_molecules = elite_batch + rand_batch
         else:
-            target_series = pd.Series([0.0] * n_molecules)
+            batch_molecules = generate_molecules_from_pools(
+                rxn_id, batch_size_actual, pool_A_ids, pool_B_ids, pool_C_ids, is_three_component, seed, component_weights
+            )
         
-        if antitarget_scores_by_model:
-            antitarget_array = np.array([antitarget_scores_by_model[i] for i in sorted(antitarget_scores_by_model.keys())], 
-                                       dtype=np.float32)
-            avg_antitarget_scores = antitarget_array.mean(axis=0)
-            antitarget_series = pd.Series(avg_antitarget_scores)
+        if not batch_molecules:
+            continue
+            
+        batch_df = pd.DataFrame({"name": batch_molecules})
+        batch_df = batch_df[batch_df["name"].notna()]  # Remove None values
+        if batch_df.empty:
+            continue
+            
+        batch_df = validate_molecules(batch_df, subnet_config)
+        
+        if batch_df.empty:
+            continue
+
+        batch_df = batch_df.drop_duplicates(subset=["InChIKey"], keep="first")
+        
+        mask = ~batch_df["InChIKey"].isin(seen_keys)
+        if avoid_inchikeys:
+            mask = mask & ~batch_df["InChIKey"].isin(avoid_inchikeys)
+        batch_df = batch_df[mask]
+        
+        if batch_df.empty:
+            continue
+        
+        seen_keys.update(batch_df["InChIKey"].values)
+        valid_dfs.append(batch_df[["name", "smiles", "InChIKey"]].copy())
+        total_valid += len(batch_df)
+        
+        if total_valid >= n_samples:
+            break
+        
+    if not valid_dfs:
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+    
+    # Concatenate all DataFrames at once
+    result_df = pd.concat(valid_dfs, ignore_index=True)
+    return result_df.head(n_samples).copy()
+
+
+def generate_molecules_from_pools(rxn_id: int, n: int, pool_A_ids: List[Tuple], pool_B_ids: List[Tuple], 
+                                pool_C_ids: List[Tuple], is_three_component: bool, seed: int = None,
+                                component_weights: dict = None) -> List[str]:
+    
+    rng = random.Random(seed) if seed is not None else random
+
+    # Use weighted sampling if component weights are provided
+    if component_weights:
+        # Build weights for each component pool
+        weights_A = [component_weights.get('A', {}).get(aid, 1.0) for aid in pool_A_ids]
+        weights_B = [component_weights.get('B', {}).get(bid, 1.0) for bid in pool_B_ids]
+        weights_C = [component_weights.get('C', {}).get(cid, 1.0) for cid in pool_C_ids] if is_three_component else None
+        
+        # Normalize weights
+        if weights_A:
+            sum_w = sum(weights_A)
+            weights_A = [w / sum_w if sum_w > 0 else 1.0/len(weights_A) for w in weights_A]
+        if weights_B:
+            sum_w = sum(weights_B)
+            weights_B = [w / sum_w if sum_w > 0 else 1.0/len(weights_B) for w in weights_B]
+        if weights_C:
+            sum_w = sum(weights_C)
+            weights_C = [w / sum_w if sum_w > 0 else 1.0/len(weights_C) for w in weights_C]
+        
+        picks_A = rng.choices(pool_A_ids, weights=weights_A, k=n) if weights_A else rng.choices(pool_A_ids, k=n)
+        picks_B = rng.choices(pool_B_ids, weights=weights_B, k=n) if weights_B else rng.choices(pool_B_ids, k=n)
+        if is_three_component:
+            picks_C = rng.choices(pool_C_ids, weights=weights_C, k=n) if weights_C else rng.choices(pool_C_ids, k=n)
+            names = [f"rxn:{rxn_id}:{a}:{b}:{c}" for a, b, c in zip(picks_A, picks_B, picks_C)]
         else:
-            antitarget_series = pd.Series([0.0] * n_molecules)
-        
-        return target_series, antitarget_series
-        
-    except Exception as e:
-        bt.logging.error(f"Parallel scoring failed: {e}")
-        return pd.Series([0.0] * n_molecules), pd.Series([0.0] * n_molecules)
-
-
-def build_component_weights(top_pool: pd.DataFrame, rxn_id: int) -> Dict[str, Dict[int, float]]:
-    """
-    Build component weights based on scores of molecules containing them.
-    Returns dict with 'A', 'B', 'C' keys mapping to {component_id: weight}
-    """
-    weights = {'A': defaultdict(float), 'B': defaultdict(float), 'C': defaultdict(float)}
-    counts = {'A': defaultdict(int), 'B': defaultdict(int), 'C': defaultdict(int)}
+            names = [f"rxn:{rxn_id}:{a}:{b}" for a, b in zip(picks_A, picks_B)]
+    else:
+        # Uniform random sampling
+        picks_A = rng.choices(pool_A_ids, k=n)
+        picks_B = rng.choices(pool_B_ids, k=n)
+        if is_three_component:
+            picks_C = rng.choices(pool_C_ids, k=n)
+            names = [f"rxn:{rxn_id}:{a}:{b}:{c}" for a, b, c in zip(picks_A, picks_B, picks_C)]
+        else:
+            names = [f"rxn:{rxn_id}:{a}:{b}" for a, b in zip(picks_A, picks_B)]
     
-    if top_pool.empty:
-        return weights
+    # Remove duplicates while preserving order
+    names = list(dict.fromkeys(names))
+    return names
+
+def _parse_components(name: str) -> tuple[int, int, int | None]:
+    # name format: "rxn:{rxn_id}:{A}:{B}" or "rxn:{rxn_id}:{A}:{B}:{C}"
+    parts = name.split(":")
+    if len(parts) < 4:
+        return None, None, None
+    A = int(parts[2]); B = int(parts[3])
+    C = int(parts[4]) if len(parts) > 4 else None
+    return A, B, C
+
+def _ids_from_pool(pool):
+    return [x[0] for x in pool]
+
+def generate_offspring_from_elites(rxn_id: int, n: int,
+                                   is_three_component: bool,
+                                   elite_names:list,
+                                   pool_A_ids:list,
+                                   pool_B_ids:list,
+                                   pool_C_ids:list,
+                                   mutation_prob: float = 0.1, seed: int | None = None,
+                                   avoid_names: set[str] = None,
+                                   avoid_inchikeys: set[str] = None,
+                                   max_tries: int = 10) -> list[str]:
     
-    # Extract component IDs and scores
-    for _, row in top_pool.iterrows():
-        name = row['name']
-        score = row['score']
-        parts = name.split(":")
-        if len(parts) >= 4:
-            try:
-                A_id = int(parts[2])
-                B_id = int(parts[3])
-                weights['A'][A_id] += max(0, score)  # Only positive contributions
-                weights['B'][B_id] += max(0, score)
-                counts['A'][A_id] += 1
-                counts['B'][B_id] += 1
-                
-                if len(parts) > 4:
-                    C_id = int(parts[4])
-                    weights['C'][C_id] += max(0, score)
-                    counts['C'][C_id] += 1
-            except (ValueError, IndexError):
+    rng = random.Random(seed) if seed is not None else random
+    elite_As, elite_Bs, elite_Cs = set(), set(), set()
+    for name in elite_names:
+        A, B, C = _parse_components(name)
+        if A is not None: elite_As.add(A)
+        if B is not None: elite_Bs.add(B)
+        if C is not None and is_three_component: elite_Cs.add(C)
+    
+    elite_As_list = list(elite_As) if elite_As else []
+    elite_Bs_list = list(elite_Bs) if elite_Bs else []
+    elite_Cs_list = list(elite_Cs) if elite_Cs else []
+
+    out = []
+    local_names = set()
+    # Pre-check if we need to avoid InChIKeys to optimize the inner loop
+    check_inchikeys = avoid_inchikeys is not None and len(avoid_inchikeys) > 0
+    
+    for _ in range(n):
+        cand = None
+        name = None
+        for _try in range(max_tries):
+            use_mutA = (not elite_As) or (rng.random() < mutation_prob)
+            use_mutB = (not elite_Bs) or (rng.random() < mutation_prob)
+            use_mutC = (not elite_Cs) or (rng.random() < mutation_prob)
+
+            A = rng.choice(pool_A_ids) if use_mutA else rng.choice(elite_As_list)
+            B = rng.choice(pool_B_ids) if use_mutB else rng.choice(elite_Bs_list)
+            if is_three_component:
+                C = rng.choice(pool_C_ids) if use_mutC else rng.choice(elite_Cs_list)
+                name = f"rxn:{rxn_id}:{A}:{B}:{C}"
+            else:
+                name = f"rxn:{rxn_id}:{A}:{B}"
+
+            # Fast checks first (set membership is O(1))
+            if avoid_names and name in avoid_names:
                 continue
-    
-    # Normalize by count and add smoothing
-    for role in ['A', 'B', 'C']:
-        for comp_id in weights[role]:
-            if counts[role][comp_id] > 0:
-                weights[role][comp_id] = weights[role][comp_id] / counts[role][comp_id] + 0.1  # Smoothing
-    
-    return weights
+            if name in local_names:
+                continue
 
+            if check_inchikeys:
+                try:
+                    key = _inchikey_from_name_cached(name)
+                    if key and key in avoid_inchikeys:
+                        continue
+                except Exception:
+                    pass
 
-def select_diverse_elites(top_pool: pd.DataFrame, n_elites: int, min_score_ratio: float = 0.7) -> pd.DataFrame:
-    """
-    Select diverse elite molecules: top by score, but ensure diversity in component space.
-    """
-    if top_pool.empty or n_elites <= 0:
-        return pd.DataFrame()
-    
-    # Take top candidates (more than needed for diversity filtering)
-    top_candidates = top_pool.head(min(len(top_pool), n_elites * 3))
-    if len(top_candidates) <= n_elites:
-        return top_candidates
-    
-    # Score threshold: at least min_score_ratio of max score
-    max_score = top_candidates['score'].max()
-    threshold = max_score * min_score_ratio
-    candidates = top_candidates[top_candidates['score'] >= threshold]
-    
-    # Select diverse set: prefer molecules with different components
-    selected = []
-    used_components = {'A': set(), 'B': set(), 'C': set()}
-    
-    # First, add top scorer
-    if not candidates.empty:
-        top_idx = candidates.index[0]
-        top_row = candidates.iloc[0]
-        selected.append(top_idx)
-        parts = top_row['name'].split(":")
-        if len(parts) >= 4:
-            try:
-                used_components['A'].add(int(parts[2]))
-                used_components['B'].add(int(parts[3]))
-                if len(parts) > 4:
-                    used_components['C'].add(int(parts[4]))
-            except (ValueError, IndexError):
-                pass
-    
-    # Then add diverse molecules
-    for idx, row in candidates.iterrows():
-        if len(selected) >= n_elites:
+            cand = name
             break
-        if idx in selected:
-            continue
-        
-        parts = row['name'].split(":")
-        if len(parts) >= 4:
-            try:
-                A_id = int(parts[2])
-                B_id = int(parts[3])
-                C_id = int(parts[4]) if len(parts) > 4 else None
-                
-                # Prefer molecules with new components
-                is_diverse = (A_id not in used_components['A'] or 
-                             B_id not in used_components['B'] or
-                             (C_id is not None and C_id not in used_components['C']))
-                
-                if is_diverse or len(selected) < n_elites * 0.5:  # Always take some top ones
-                    selected.append(idx)
-                    used_components['A'].add(A_id)
-                    used_components['B'].add(B_id)
-                    if C_id is not None:
-                        used_components['C'].add(C_id)
-            except (ValueError, IndexError):
-                # If parsing fails, just add it
-                if len(selected) < n_elites:
-                    selected.append(idx)
-    
-    # Fill remaining slots with top scorers
-    for idx, row in candidates.iterrows():
-        if len(selected) >= n_elites:
-            break
-        if idx not in selected:
-            selected.append(idx)
-    
-    return candidates.loc[selected[:n_elites]] if selected else candidates.head(n_elites)
 
-
-def main(config: dict):
-    n_samples = config["num_molecules"] * 5
-    top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score", "Target", "Anti"])
-    rxn_id = int(config["allowed_reaction"].split(":")[-1])
-    iteration = 0
-    mutation_prob = 0.1
-    elite_frac = 0.25
-    prev_avg_score = None
-    score_improvement_rate = 0.0
-    seen_inchikeys = set()
-    start = time.time()
-
-    n_samples_first_iteration = n_samples if config["allowed_reaction"] == "rxn:5" else n_samples*4
-    
-    bt.logging.info(f"[Miner] Starting optimization: {len(target_models)} target, {len(antitarget_models)} antitarget models")
-    
-    # File writing control
-    FILE_WRITE_DELAY = 25 * 60  # 25 minutes in seconds
-    file_writing_enabled = False
-    
-    while time.time() - start < 1800:
-        iteration += 1
-        start_time = time.time()
-        
-        # Enable file writing after 25 minutes
-        elapsed_time = time.time() - start
-        if not file_writing_enabled and elapsed_time >= FILE_WRITE_DELAY:
-            file_writing_enabled = True
-            bt.logging.info(f"[Miner] File writing enabled at {elapsed_time/60:.1f} minutes")
-        
-        # Build component weights from top pool for score-guided sampling
-        component_weights = build_component_weights(top_pool, rxn_id) if not top_pool.empty else None
-        
-        # Select diverse elites (not just top by score)
-        elite_df = select_diverse_elites(top_pool, min(100, len(top_pool))) if not top_pool.empty else pd.DataFrame()
-        elite_names = elite_df["name"].tolist() if not elite_df.empty else None
-        
-        # Adaptive sampling: adjust based on score improvement
-        if prev_avg_score is not None and not top_pool.empty:
-            current_avg = top_pool['score'].mean()
-            score_improvement_rate = (current_avg - prev_avg_score) / max(abs(prev_avg_score), 1e-6)
-            
-            # If improving well, increase exploitation; if stagnating, increase exploration
-            if score_improvement_rate > 0.01:  # Good improvement
-                elite_frac = min(0.7, elite_frac * 1.1)
-                mutation_prob = max(0.05, mutation_prob * 0.95)
-            elif score_improvement_rate < -0.01:  # Declining
-                elite_frac = max(0.2, elite_frac * 0.9)
-                mutation_prob = min(0.4, mutation_prob * 1.1)
-        
-        data = generate_valid_random_molecules_batch(
-            rxn_id, 
-            n_samples=n_samples_first_iteration if iteration == 1 else n_samples, 
-            db_path=DB_PATH, 
-            subnet_config=config, 
-            batch_size=300, 
-            elite_names=elite_names, 
-            elite_frac=elite_frac, 
-            mutation_prob=mutation_prob, 
-            avoid_inchikeys=seen_inchikeys, 
-            component_weights=component_weights
-        )
-        
-        if data.empty:
-            continue
-
-        try:
-            filtered_data = data[~data['InChIKey'].isin(seen_inchikeys)]
-
-            dup_ratio = (len(data) - len(filtered_data)) / max(1, len(data))
-            if dup_ratio > 0.6:
-                mutation_prob = min(0.5, mutation_prob * 1.5)
-                elite_frac = max(0.2, elite_frac * 0.8)
-            elif dup_ratio < 0.2 and not top_pool.empty:
-                mutation_prob = max(0.05, mutation_prob * 0.9)
-                elite_frac = min(0.8, elite_frac * 1.1)
-
-            data = filtered_data
-
-        except Exception as e:
-            bt.logging.error(f"Deduplication failed: {e}")
-
-        data = data.reset_index(drop=True)
-        
-        if data.empty:
-            continue
-        
-        # PARALLEL SCORING
-        target_scores, antitarget_scores = parallel_score_molecules(data['smiles'], config)
-        
-        data['Target'] = target_scores
-        data['Anti'] = antitarget_scores
-        data['score'] = data['Target'] - (config['antitarget_weight'] * data['Anti'])
-        
-        seen_inchikeys.update([k for k in data["InChIKey"].tolist() if k])
-        
-        # Keep Target and Anti columns for statistics
-        total_data = data[["name", "smiles", "InChIKey", "score", "Target", "Anti"]]
-        top_pool = pd.concat([top_pool, total_data])
-        top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
-        top_pool = top_pool.sort_values(by="score", ascending=False)
-        top_pool = top_pool.head(config["num_molecules"])
-        
-        # Calculate statistics
-        avg_score = top_pool['score'].mean()
-        max_score = top_pool['score'].max()
-        min_score = top_pool['score'].min()
-        
-        # Update previous average
-        prev_avg_score = avg_score
-        
-        # Log every 5 iterations or if significant improvement
-        if iteration % 5 == 0 or (iteration > 1 and max_score > 2.45):
-            bt.logging.info(f"[Miner] Iter {iteration}: Avg={avg_score:.4f}, Max={max_score:.4f}, Min={min_score:.4f}")
-        
-        # Save results ONLY after 25 minutes
-        if file_writing_enabled:
-            top_entries = {"molecules": top_pool["name"].tolist()}
-            tmp_path = os.path.join(OUTPUT_DIR, "result.json.tmp")
-            final_path = os.path.join(OUTPUT_DIR, "result.json")
-            with open(tmp_path, "w") as f:
-                json.dump(top_entries, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, final_path)
-    
-    # Final summary
-    bt.logging.info(f"[Miner] ===== COMPLETE =====")
-    bt.logging.info(f"[Miner] Iterations: {iteration}, Avg: {avg_score:.4f}, Max: {max_score:.4f}")
-    bt.logging.info(f"[Miner] Total molecules explored: {len(seen_inchikeys)}")
-    
-    # Final save (ensure we write at the end)
-    top_entries = {"molecules": top_pool["name"].tolist()}
-    tmp_path = os.path.join(OUTPUT_DIR, "result.json.tmp")
-    final_path = os.path.join(OUTPUT_DIR, "result.json")
-    with open(tmp_path, "w") as f:
-        json.dump(top_entries, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, final_path)
-
-
-if __name__ == "__main__":
-    config = get_config()
-    start_time_1 = time.time()
-    initialize_models(config)
-    bt.logging.info(f"[Miner] Model initialization: {time.time() - start_time_1:.2f}s")
-    main(config)
+        if cand is None:
+            if name is None:
+                A = rng.choice(pool_A_ids)
+                B = rng.choice(pool_B_ids)
+                if is_three_component:
+                    C = rng.choice(pool_C_ids) if pool_C_ids else 0
+                    name = f"rxn:{rxn_id}:{A}:{B}:{C}"
+                else:
+                    name = f"rxn:{rxn_id}:{A}:{B}"
+            cand = name
+        out.append(cand)
+        local_names.add(cand)
+        if avoid_names is not None:
+            avoid_names.add(cand)
+    return out
